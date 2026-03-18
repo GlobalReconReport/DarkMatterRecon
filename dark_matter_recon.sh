@@ -16,7 +16,7 @@
 #    ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║
 #    ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝╚═╝  ╚═══╝
 #
-#    GlobalDarkRecon — Dark Matter Recon v2.0
+#    GlobalDarkRecon — Dark Matter Recon v2.1
 #    Red Team OSINT Challenge Framework
 #    For use on domains you own only.
 #
@@ -30,7 +30,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
 fi
 
 # ── GLOBAL CONFIG ────────────────────────────────────────────
-SCRIPT_VERSION="2.0"
+SCRIPT_VERSION="2.1"
 TARGET=""
 TARGET_FILE=""
 SHODAN_API_KEY="${SHODAN_API_KEY:-}"
@@ -39,6 +39,18 @@ STEALTH_MODE=false
 QUIET=false
 LIGHT_MODE=false
 ENABLE_AMASS=false
+USE_TOR=false
+USE_DOH=false
+
+# Tor SOCKS5 proxy address (port 9050 is Tor's default on Kali)
+TOR_SOCKS="socks5h://127.0.0.1:9050"
+# DNS-over-HTTPS server (Cloudflare)
+DOH_SERVER="https://1.1.1.1/dns-query"
+
+# Adaptive block-detection state (reset per target)
+CONSECUTIVE_BLOCKS=0
+HTTP_BLOCKED=false
+TOR_CIRCUIT_ROTATIONS=0
 
 # Initialized per target by init_target_env()
 RESULTS_DIR=""
@@ -163,14 +175,156 @@ jitter() {
     local min="${1:-2}" max="${2:-8}"
     local delay
     if command -v awk &>/dev/null; then
-        delay=$(awk "BEGIN{srand(); printf \"%.1f\", $min+rand()*($max-$min)}")
+        # Pass min/max as awk variables — prevents shell-injection in awk program string
+        delay=$(awk -v min="$min" -v max="$max" 'BEGIN{srand(); printf "%.1f", min+rand()*(max-min)}')
     else
-        # Pure bash fallback — integer seconds in [min, max]
-        local range=$(( max - min ))
-        delay=$(( min + RANDOM % (range + 1) ))
+        # Pure bash fallback — convert potentially-float args to integers safely
+        local imin imax
+        imin=$(printf '%.0f' "$min" 2>/dev/null) || imin=2
+        imax=$(printf '%.0f' "$max" 2>/dev/null) || imax=8
+        [[ $imin -ge $imax ]] && imax=$(( imin + 1 ))
+        delay=$(( imin + RANDOM % (imax - imin + 1) ))
     fi
     stealth "Jitter sleep ${delay}s..."
     sleep "$delay"
+}
+
+# ════════════════════════════════════════════════════════════
+# TOR INTEGRATION
+# nmap always runs native (raw-packet SYN scans bypass SOCKS).
+# All curl/whois/harvester calls route through Tor when --tor.
+# ════════════════════════════════════════════════════════════
+
+setup_tor() {
+    if [[ "$USE_TOR" != "true" ]]; then return 0; fi
+
+    info "Setting up Tor routing..."
+
+    # Check if Tor is already listening on 9050
+    if ! nc -z 127.0.0.1 9050 2>/dev/null; then
+        stealth "Tor not running — attempting sudo systemctl start tor..."
+        if sudo systemctl start tor 2>/dev/null; then
+            sleep 5   # give Tor time to build circuits
+        else
+            warn "Could not start Tor — disabling --tor flag (install: sudo apt install tor)"
+            USE_TOR=false
+            return 1
+        fi
+    fi
+
+    # Route all curl calls through Tor via ALL_PROXY (no per-call changes needed)
+    export ALL_PROXY="$TOR_SOCKS"
+    export HTTPS_PROXY="$TOR_SOCKS"
+    export HTTP_PROXY="$TOR_SOCKS"
+
+    # Verify exit IP
+    local exit_ip
+    exit_ip=$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:9050 \
+        "https://check.torproject.org/api/ip" 2>/dev/null \
+        | grep -o '"IP":"[^"]*"' | sed 's/"IP":"//;s/"//')
+    if [[ -n "$exit_ip" ]]; then
+        found "Tor active — exit IP: $exit_ip"
+    else
+        warn "Tor proxy set but exit-IP check failed (may still work)"
+    fi
+}
+
+rotate_tor_circuit() {
+    if [[ "$USE_TOR" != "true" ]]; then return 0; fi
+
+    stealth "Rotating Tor circuit..."
+
+    # Prefer control port NEWNYM signal; fall back to SIGHUP
+    if command -v nc &>/dev/null && nc -z 127.0.0.1 9051 2>/dev/null; then
+        printf 'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\nQUIT\r\n' \
+            | nc -q 2 127.0.0.1 9051 &>/dev/null || true
+    else
+        sudo killall -HUP tor 2>/dev/null || true
+    fi
+
+    jitter 5 8   # wait for new circuit to build
+
+    TOR_CIRCUIT_ROTATIONS=$(( TOR_CIRCUIT_ROTATIONS + 1 ))
+    local new_ip
+    new_ip=$(curl -s --max-time 12 --socks5-hostname 127.0.0.1:9050 \
+        "https://check.torproject.org/api/ip" 2>/dev/null \
+        | grep -o '"IP":"[^"]*"' | sed 's/"IP":"//;s/"//')
+    [[ -n "$new_ip" ]] && stealth "New Tor exit: $new_ip"
+}
+
+# ════════════════════════════════════════════════════════════
+# DNS-OVER-HTTPS  (--doh flag)
+# Replaces plain dig +short A-record lookups with DoH queries
+# to Cloudflare 1.1.1.1 — bypasses local DNS monitoring.
+# ════════════════════════════════════════════════════════════
+
+# Usage: dig_or_doh <hostname> [<type=A>]
+# Prints resolved IPs one per line (same output as dig +short)
+dig_or_doh() {
+    local host="$1" qtype="${2:-A}"
+    if [[ "$USE_DOH" == "true" ]]; then
+        # Temporarily unset proxy for DoH — hits 1.1.1.1 directly
+        ALL_PROXY="" HTTPS_PROXY="" HTTP_PROXY="" \
+        curl -s --max-time 8 \
+            -H "accept: application/dns-json" \
+            "${DOH_SERVER}?name=${host}&type=${qtype}" 2>/dev/null \
+        | grep -o '"data":"[^"]*"' \
+        | sed 's/"data":"//;s/"//' \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    else
+        dig +short "$host" "$qtype" 2>/dev/null \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    fi
+}
+
+# Whois respecting Tor when active
+net_whois() {
+    local domain="$1"
+    if [[ "$USE_TOR" == "true" ]] && command -v torsocks &>/dev/null; then
+        torsocks whois "$domain" 2>/dev/null
+    else
+        whois "$domain" 2>/dev/null
+    fi
+}
+
+# ════════════════════════════════════════════════════════════
+# ADAPTIVE BLOCK DETECTION
+# Detect rate-limiting (429/503) and blocks (403) from HTTP
+# responses and back off intelligently.
+# ════════════════════════════════════════════════════════════
+
+check_block_signal() {
+    local http_code="$1" context="${2:-request}"
+
+    case "$http_code" in
+        429|503)
+            CONSECUTIVE_BLOCKS=$(( CONSECUTIVE_BLOCKS + 1 ))
+            local backoff=$(( 15 * CONSECUTIVE_BLOCKS ))
+            [[ $backoff -gt 120 ]] && backoff=120
+            warn "Rate-limited (HTTP $http_code) on $context — backing off ${backoff}s"
+            sleep "$backoff"
+            # Rotate UA for next request
+            UA="${UA_LIST[$RANDOM % ${#UA_LIST[@]}]}"
+            # Rotate Tor circuit if active
+            [[ "$USE_TOR" == "true" ]] && rotate_tor_circuit
+            ;;
+        403)
+            CONSECUTIVE_BLOCKS=$(( CONSECUTIVE_BLOCKS + 1 ))
+            warn "Blocked (HTTP 403) on $context (consecutive: $CONSECUTIVE_BLOCKS)"
+            if (( CONSECUTIVE_BLOCKS >= 3 )); then
+                HTTP_BLOCKED=true
+                critical "PERSISTENT BLOCK detected after $CONSECUTIVE_BLOCKS 403 responses"
+                warn "Consider: longer jitter, --stealth mode, or --tor"
+                jitter 20 40
+            else
+                jitter 5 15
+            fi
+            ;;
+        200|201|301|302|304)
+            # Successful response — reset consecutive block counter
+            CONSECUTIVE_BLOCKS=0
+            ;;
+    esac
 }
 
 # ════════════════════════════════════════════════════════════
@@ -236,6 +390,8 @@ run_phase() {
 
     phase_cleanup
     drop_caches
+    # Rotate Tor circuit between phases to vary exit node
+    [[ "$USE_TOR" == "true" ]] && rotate_tor_circuit
     show_progress $(( phase_num + 1 ))
 }
 
@@ -292,7 +448,7 @@ validate_domain() {
         return 1
     fi
     local ip
-    ip=$(dig +short "$domain" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+    ip=$(dig_or_doh "$domain" | head -1)
     if [[ -z "$ip" ]]; then
         echo -e "${YELLOW}  [!] '$domain' has no A record (may be CDN-only, CNAME, or non-existent)${NC}"
         if [[ -t 0 ]]; then
@@ -321,6 +477,9 @@ init_target_env() {
     PHASE_TEMP_FILES=()
     CF_RANGES_LIVE=""
     SCAN_START_SECONDS=$SECONDS
+    CONSECUTIVE_BLOCKS=0
+    HTTP_BLOCKED=false
+    TOR_CIRCUIT_ROTATIONS=0
 
     mkdir -p "$RESULTS_DIR"
     touch "$REPORT" "$REAL_IP_FILE"
@@ -388,7 +547,12 @@ generate_json_report() {
     "duration_seconds": ${duration},
     "results_dir": "${RESULTS_DIR}",
     "light_mode": ${LIGHT_MODE},
-    "amass_enabled": ${ENABLE_AMASS}
+    "amass_enabled": ${ENABLE_AMASS},
+    "tor_enabled": ${USE_TOR},
+    "doh_enabled": ${USE_DOH},
+    "tor_circuit_rotations": ${TOR_CIRCUIT_ROTATIONS},
+    "blocks_detected": ${CONSECUTIVE_BLOCKS},
+    "http_blocked": ${HTTP_BLOCKED}
   },
   "severity_summary": {
     "CRITICAL": ${COUNT_CRITICAL},
@@ -441,8 +605,8 @@ print_banner() {
 
 check_deps() {
     phase "DEPENDENCY CHECK"
-    local required=(nmap curl dig whois openssl host)
-    local optional=(subfinder wpscan wafw00f whatweb gobuster theHarvester shodan amass awk)
+    local required=(nmap curl dig whois openssl host nc)
+    local optional=(subfinder wpscan wafw00f whatweb gobuster theHarvester shodan amass awk torsocks proxychains4)
     local missing_opt=()
 
     for cmd in "${required[@]}"; do
@@ -467,6 +631,8 @@ check_deps() {
 
     [[ "$ENABLE_AMASS" == "false" ]] && info "amass disabled by default (use --enable-amass to enable)"
     [[ "$LIGHT_MODE"   == "true"  ]] && info "--light mode: nmap parallelism reduced, subfinder capped at 50, Wayback skipped"
+    [[ "$USE_TOR"      == "true"  ]] && info "--tor active: curl/whois/harvester routed through Tor SOCKS5; nmap always native"
+    [[ "$USE_DOH"      == "true"  ]] && info "--doh active: A-record lookups use DNS-over-HTTPS (Cloudflare 1.1.1.1)"
 
     if [[ ${#missing_opt[@]} -gt 0 ]]; then
         echo ""
@@ -493,6 +659,9 @@ usage() {
     echo "  --quiet               Suppress verbose output; only CRITICAL/HIGH shown on screen"
     echo "  --light               Low-RAM mode: reduced nmap, cap subfinder@50, skip Wayback"
     echo "  --enable-amass        Enable amass passive enum (disabled by default — high RAM)"
+    echo "  --tor                 Route HTTP/WHOIS through Tor SOCKS5; rotate circuit between phases"
+    echo "                        (nmap always runs native — raw-packet SYN scans bypass SOCKS)"
+    echo "  --doh                 Use DNS-over-HTTPS for A-record lookups (Cloudflare 1.1.1.1)"
     echo "  --report-only         Print last saved report and exit"
     echo "  --help, -h            Show this help"
     echo ""
@@ -507,9 +676,10 @@ usage() {
     echo "  ├── DARK_MATTER_REPORT.txt     (full text report)"
     echo "  ├── dark_matter_summary.json   (machine-readable summary)"
     echo "  ├── origin_ip_candidates.txt   (potential origin IPs)"
-    echo "  ├── gravatar_hashes.txt        (extracted MD5 hashes)"
-    echo "  ├── nmap_common.txt            (port scan)"
-    echo "  └── nmap_scripts.txt           (service fingerprint)"
+    echo "  ├── gravatar_hashes.txt          (extracted MD5 hashes)"
+    echo "  ├── gravatar_hashes_details.txt (resolved display names/usernames)"
+    echo "  ├── nmap_common.txt             (port scan)"
+    echo "  └── nmap_scripts.txt            (service fingerprint)"
     exit 0
 }
 
@@ -537,7 +707,7 @@ phase0_passive() {
     sep
     info "DNS Resolution & Records"
     local CURRENT_IP
-    CURRENT_IP=$(dig +short "$TARGET" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+    CURRENT_IP=$(dig_or_doh "$TARGET" | head -1)
     if [[ -n "$CURRENT_IP" ]]; then
         found "Current A record: $TARGET → $CURRENT_IP"
         save_ip_candidate "$CURRENT_IP" "current A record"
@@ -552,7 +722,7 @@ phase0_passive() {
         found "MX: $mx"
         local mx_host="${mx##* }"
         local mx_ip
-        mx_ip=$(dig +short "$mx_host" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+        mx_ip=$(dig_or_doh "$mx_host" | head -1)
         [[ -n "$mx_ip" ]] && save_ip_candidate "$mx_ip" "MX record for $mx"
     done < <(dig MX "$TARGET" +short 2>/dev/null)
 
@@ -582,7 +752,7 @@ phase0_passive() {
     info "WHOIS — Registrant & Infrastructure"
     local whois_temp
     whois_temp=$(make_temp)
-    if whois "$TARGET" > "$whois_temp" 2>/dev/null; then
+    if net_whois "$TARGET" > "$whois_temp"; then
         grep -iE '(registrar|registrant|name server|creation|expir|status|email)' "$whois_temp" \
             | head -20 | while IFS= read -r line; do info "$line"; done
 
@@ -619,7 +789,7 @@ phase0_passive() {
         while IFS= read -r sub; do
             found "SUBDOMAIN: $sub"
             local sub_ip
-            sub_ip=$(dig +short "$sub" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+            sub_ip=$(dig_or_doh "$sub" | head -1)
             if [[ -n "$sub_ip" ]]; then
                 info "  $sub → $sub_ip"
                 save_ip_candidate "$sub_ip" "subdomain: $sub"
@@ -667,9 +837,9 @@ phase0_passive() {
     if [[ -n "$SHODAN_API_KEY" ]]; then
         info "Querying Shodan API for $TARGET..."
         local shodan_result shodan_ip
-        shodan_result=$(curl -s --max-time 15 \
-            "https://api.shodan.io/dns/resolve?hostnames=$TARGET&key=$SHODAN_API_KEY" 2>/dev/null)
-        if [[ $? -ne 0 ]] || [[ -z "$shodan_result" ]]; then
+        if ! shodan_result=$(curl -s --max-time 15 \
+            "https://api.shodan.io/dns/resolve?hostnames=$TARGET&key=$SHODAN_API_KEY" 2>/dev/null) \
+            || [[ -z "$shodan_result" ]]; then
             warn "Shodan DNS resolve failed (network error or invalid key)"
         else
             shodan_ip=$(echo "$shodan_result" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
@@ -695,11 +865,10 @@ phase0_passive() {
         hist=$(curl -s --max-time 15 \
             "https://api.shodan.io/shodan/host/search?query=hostname:$TARGET&key=$SHODAN_API_KEY" 2>/dev/null)
         if [[ -n "$hist" ]]; then
-            echo "$hist" | grep -oE '"ip_str":"[^"]*"' | sed 's/"ip_str":"//;s/"//' | sort -u \
-            | while IFS= read -r hip; do
+            while IFS= read -r hip; do
                 save_ip_candidate "$hip" "Shodan historical"
                 high "HISTORICAL IP via Shodan: $hip"
-            done
+            done < <(echo "$hist" | grep -oE '"ip_str":"[^"]*"' | sed 's/"ip_str":"//;s/"//' | sort -u)
         fi
     else
         warn "No Shodan API key — skipping (set SHODAN_API_KEY env var)"
@@ -713,17 +882,17 @@ phase0_passive() {
     info "DNS History — checking for pre-Cloudflare IPs (HackerTarget)"
     # Stream directly into REAL_IP_FILE — no large variable needed
     local hackertarget_out
-    hackertarget_out=$(curl -s --max-time 15 \
-        "https://api.hackertarget.com/hostsearch/?q=$TARGET" 2>/dev/null)
-    if [[ $? -ne 0 ]] || echo "$hackertarget_out" | grep -q "error\|rate limit"; then
+    if ! hackertarget_out=$(curl -s --max-time 15 \
+        "https://api.hackertarget.com/hostsearch/?q=$TARGET" 2>/dev/null) \
+        || echo "$hackertarget_out" | grep -q "error\|rate limit"; then
         warn "HackerTarget rate limited or failed — try https://securitytrails.com manually"
     else
-        echo "$hackertarget_out" | while IFS=',' read -r host ip; do
+        while IFS=',' read -r host ip; do
             if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                 found "Historical: $host → $ip"
                 save_ip_candidate "$ip" "DNS history: $host"
             fi
-        done
+        done < <(echo "$hackertarget_out")
     fi
 
     # ── Origin IP Summary ─────────────────────────────────────
@@ -926,7 +1095,7 @@ phase2_subdomains() {
         else
             subfinder -d "$TARGET" -silent 2>/dev/null >> "$subs_temp"
         fi
-        found "subfinder complete ($(sort -u "$subs_temp" | wc -l) unique so far)"
+        found "subfinder complete (running total: $(wc -l < "$subs_temp") entries)"
     fi
 
     # ── amass passive (disabled by default — high RAM usage) ──
@@ -935,7 +1104,7 @@ phase2_subdomains() {
             info "Running amass passive enum..."
             jitter 3 7
             amass enum -passive -d "$TARGET" 2>/dev/null >> "$subs_temp"
-            found "amass complete ($(sort -u "$subs_temp" | wc -l) unique so far)"
+            found "amass complete (running total: $(wc -l < "$subs_temp") entries)"
         else
             warn "amass not installed — skipping"
         fi
@@ -967,7 +1136,7 @@ phase2_subdomains() {
         jitter 0.2 0.8
         local full="${sub}.${TARGET}"
         local ip
-        ip=$(dig +short "$full" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+        ip=$(dig_or_doh "$full" | head -1)
         if [[ -n "$ip" ]]; then
             echo "$full" >> "$subs_temp"
             found "DNS BRUTEFORCE HIT: $full → $ip"
@@ -977,8 +1146,12 @@ phase2_subdomains() {
 
     # ── Resolve all discovered subdomains ─────────────────────
     sep
+    # Sort once into a second temp file — avoids 3 repeated sort -u calls
+    local subs_sorted
+    subs_sorted=$(make_temp)
+    sort -u "$subs_temp" > "$subs_sorted"
     local total_subs
-    total_subs=$(sort -u "$subs_temp" | wc -l)
+    total_subs=$(wc -l < "$subs_sorted")
     info "Resolving all $total_subs unique subdomains (streaming, no large array)..."
     {
         echo ""
@@ -988,12 +1161,12 @@ phase2_subdomains() {
     # Process line-by-line — never load all subdomains into a bash array
     while IFS= read -r sub; do
         local ip
-        ip=$(dig +short "$sub" 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+        ip=$(dig_or_doh "$sub" | head -1)
         if [[ -n "$ip" ]]; then
             echo "[SUBDOMAIN] $sub → $ip" >> "$REPORT"
             save_ip_candidate "$ip" "subdomain: $sub"
         fi
-    done < <(sort -u "$subs_temp")
+    done < "$subs_sorted"
 
     found "Total unique subdomains discovered: $total_subs"
 }
@@ -1033,7 +1206,8 @@ phase3_port_scan() {
 
     # ── Standard ports scan ───────────────────────────────────
     info "Phase 3a: Common ports on $SCAN_TARGET"
-    stealth "Flags: -sV -sC -T2 -f --data-length 24"
+    stealth "Flags: -sV -sC -T2 -f --data-length 24 -D RND:5 --scan-delay 500ms --max-retries 2"
+    warn "nmap always runs native (raw SYN scans are incompatible with Tor/SOCKS5)"
 
     local nmap_parallelism="--min-parallelism 5"
     [[ "$LIGHT_MODE" == "true" ]] && nmap_parallelism="--min-parallelism 1"
@@ -1044,6 +1218,10 @@ phase3_port_scan() {
         -f \
         --data-length 24 \
         --randomize-hosts \
+        -D RND:5 \
+        --scan-delay 500ms \
+        --max-retries 2 \
+        --script-timeout 10s \
         $nmap_parallelism \
         -p 21,22,23,25,53,80,110,143,443,465,587,993,995,2082,2083,2086,2087,2095,2096,3000,3306,5432,6379,8080,8443,8888,27017 \
         --open \
@@ -1070,6 +1248,10 @@ phase3_port_scan() {
         -sV \
         -T2 \
         -f \
+        -D RND:5 \
+        --scan-delay 500ms \
+        --max-retries 2 \
+        --script-timeout 10s \
         $nmap_parallelism \
         --script=http-title,http-server-header,http-methods,ssl-cert,ssh-hostkey,banner \
         -p 22,80,443,8080,8443 \
@@ -1143,6 +1325,8 @@ phase4_wordpress() {
         info "Running WPScan — aggressive enumeration"
         stealth "Enumerating: plugins, themes, users, timthumbs, config backups"
         jitter 5 10
+        local wpscan_proxy_flag=()
+        [[ "$USE_TOR" == "true" ]] && wpscan_proxy_flag=(--proxy "socks5://127.0.0.1:9050")
         wpscan \
             --url "https://$TARGET" \
             --enumerate vp,vt,u,tt,cb,dbe \
@@ -1150,6 +1334,7 @@ phase4_wordpress() {
             --random-user-agent \
             --throttle 1500 \
             --no-update \
+            "${wpscan_proxy_flag[@]}" \
             --output "$RESULTS_DIR/wpscan.txt" \
             --format cli 2>/dev/null || warn "wpscan exited with error (check output file)"
 
@@ -1395,14 +1580,22 @@ phase5_osint() {
     if command -v theHarvester &>/dev/null; then
         info "Running theHarvester (bing, crtsh, dnsdumpster)..."
         jitter 3 7
-        theHarvester -d "$TARGET" -b bing,crtsh,dnsdumpster -l 100 \
-            -f "$RESULTS_DIR/theharvester" 2>/dev/null \
-            | grep -E '@|IP:' \
-            | while IFS= read -r line; do high "HARVESTED: $line"; done
+        if [[ "$USE_TOR" == "true" ]] && command -v proxychains4 &>/dev/null; then
+            stealth "theHarvester routed through proxychains4 (Tor)"
+            proxychains4 theHarvester -d "$TARGET" -b bing,crtsh,dnsdumpster -l 100 \
+                -f "$RESULTS_DIR/theharvester" 2>/dev/null \
+                | grep -E '@|IP:' \
+                | while IFS= read -r line; do high "HARVESTED: $line"; done
+        else
+            theHarvester -d "$TARGET" -b bing,crtsh,dnsdumpster -l 100 \
+                -f "$RESULTS_DIR/theharvester" 2>/dev/null \
+                | grep -E '@|IP:' \
+                | while IFS= read -r line; do high "HARVESTED: $line"; done
+        fi
     else
         info "theHarvester not installed — extracting emails from WHOIS"
         local whois_emails
-        whois_emails=$(whois "$TARGET" 2>/dev/null \
+        whois_emails=$(net_whois "$TARGET" \
             | grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | sort -u)
         if [[ -n "$whois_emails" ]]; then
             echo "$whois_emails" | while IFS= read -r email; do
@@ -1417,10 +1610,10 @@ phase5_osint() {
     sep
     info "GitHub exposure check (public code referencing $TARGET)..."
     local gh_result gh_count
-    gh_result=$(curl -s --max-time 15 \
+    if ! gh_result=$(curl -s --max-time 15 \
         -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/search/code?q=${TARGET}+in:file&per_page=5" 2>/dev/null)
-    if [[ $? -ne 0 ]] || [[ -z "$gh_result" ]]; then
+        "https://api.github.com/search/code?q=${TARGET}+in:file&per_page=5" 2>/dev/null) \
+        || [[ -z "$gh_result" ]]; then
         warn "GitHub API request failed (rate limited or network error)"
     else
         gh_count=$(echo "$gh_result" | grep -o '"total_count":[0-9]*' | grep -o '[0-9]*')
@@ -1438,10 +1631,9 @@ phase5_osint() {
     sep
     info "Checking breach exposure (HaveIBeenPwned domain search)..."
     local hibp
-    hibp=$(curl -s --max-time 10 \
+    if ! hibp=$(curl -s --max-time 10 \
         -H "hibp-api-key: free" \
-        "https://haveibeenpwned.com/api/v3/breachesforaccount/$TARGET" 2>/dev/null)
-    if [[ $? -ne 0 ]]; then
+        "https://haveibeenpwned.com/api/v3/breachesforaccount/$TARGET" 2>/dev/null); then
         warn "HIBP request failed (network error)"
     elif echo "$hibp" | grep -q "Name"; then
         high "Domain appears in known breach data — check https://haveibeenpwned.com"
@@ -1531,6 +1723,7 @@ generate_report() {
     echo -e "${CYAN}  Date      : $(date)${NC}"
     echo -e "${CYAN}  Duration  : ${dur_min}m ${dur_sec}s${NC}"
     echo -e "${CYAN}  Results   : $RESULTS_DIR${NC}"
+    echo -e "${CYAN}  Tor       : ${USE_TOR}  |  DoH: ${USE_DOH}  |  Tor Rotations: ${TOR_CIRCUIT_ROTATIONS}  |  Blocks: ${CONSECUTIVE_BLOCKS}${NC}"
     echo ""
 
     # Severity summary
@@ -1615,6 +1808,8 @@ main() {
     QUIET=false
     LIGHT_MODE=false
     ENABLE_AMASS=false
+    USE_TOR=false
+    USE_DOH=false
     TARGET_FILE=""
 
     while [[ $# -gt 0 ]]; do
@@ -1626,6 +1821,8 @@ main() {
             --quiet)         QUIET=true ;;
             --light)         LIGHT_MODE=true ;;
             --enable-amass)  ENABLE_AMASS=true ;;
+            --tor)           USE_TOR=true ;;
+            --doh)           USE_DOH=true ;;
             --target)        TARGET_FILE="$2"; shift ;;
             --report-only)
                 local latest
@@ -1667,6 +1864,7 @@ main() {
 
     # ── System checks ─────────────────────────────────────────
     check_ram
+    setup_tor
 
     # ── Run scan per target ───────────────────────────────────
     for tgt in "${targets[@]}"; do
@@ -1687,7 +1885,7 @@ main() {
         echo ""
         echo -e "${BOLD}${RED}  TARGET  : $TARGET${NC}"
         echo -e "${BOLD}${RED}  RESULTS : $RESULTS_DIR${NC}"
-        echo -e "${BOLD}${RED}  STEALTH : $STEALTH_MODE  |  QUIET: $QUIET  |  LIGHT: $LIGHT_MODE  |  AMASS: $ENABLE_AMASS${NC}"
+        echo -e "${BOLD}${RED}  STEALTH : $STEALTH_MODE  |  QUIET: $QUIET  |  LIGHT: $LIGHT_MODE  |  AMASS: $ENABLE_AMASS  |  TOR: $USE_TOR  |  DoH: $USE_DOH${NC}"
         echo ""
         echo -e "${YELLOW}  ⚠  Only scan domains you own. You own $TARGET, confirmed.${NC}"
         echo ""
