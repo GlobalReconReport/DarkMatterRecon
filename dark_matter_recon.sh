@@ -1237,7 +1237,7 @@ phase3_port_scan() {
             if echo "$line" | grep -qE '\b(3306|5432|6379|27017|1433|5984|9200)\b'; then
                 high "DATABASE PORT EXPOSED: $line"
             fi
-        done < <(grep -E '(open|filtered)' "$RESULTS_DIR/nmap_common.txt" 2>/dev/null)
+        done < <(grep -E '(open|filtered)' "$RESULTS_DIR/nmap_common.txt" 2>/dev/null | grep -v '^#')
     fi
 
     jitter 8 20
@@ -1585,11 +1585,13 @@ phase5_osint() {
             proxychains4 theHarvester -d "$TARGET" -b bing,crtsh,dnsdumpster -l 100 \
                 -f "$RESULTS_DIR/theharvester" 2>/dev/null \
                 | grep -E '@|IP:' \
+                | grep -vE 'edge-security\.com|theHarvester|@github' \
                 | while IFS= read -r line; do high "HARVESTED: $line"; done
         else
             theHarvester -d "$TARGET" -b bing,crtsh,dnsdumpster -l 100 \
                 -f "$RESULTS_DIR/theharvester" 2>/dev/null \
                 | grep -E '@|IP:' \
+                | grep -vE 'edge-security\.com|theHarvester|@github' \
                 | while IFS= read -r line; do high "HARVESTED: $line"; done
         fi
     else
