@@ -1,9 +1,67 @@
 # DarkMatterRecon
 
-**GlobalDarkRecon — Dark Matter Recon v2.0**
+**GlobalDarkRecon — Dark Matter Recon v2.1**
 Red Team OSINT Challenge Framework
 
 > For use on domains you own or have explicit written authorization to test.
+
+---
+
+## Getting Started on Kali Linux
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/GlobalReconReport/DarkMatterRecon.git ~/DarkMatterRecon
+cd ~/DarkMatterRecon
+```
+
+### 2. Make the script executable
+
+```bash
+chmod +x dark_matter_recon.sh
+```
+
+### 3. Install required tools
+
+All core dependencies ship with Kali. Verify they are present:
+
+```bash
+sudo apt update
+sudo apt install nmap curl dnsutils whois openssl netcat-openbsd -y
+```
+
+### 4. Install optional tools (recommended for full coverage)
+
+```bash
+sudo apt install wpscan wafw00f whatweb theharvester amass tor torsocks proxychains4 -y
+```
+
+Install `subfinder` (Go required):
+
+```bash
+go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+```
+
+> If `go` is not installed: `sudo apt install golang -y`
+
+### 5. Run your first scan
+
+```bash
+# Basic scan against a domain you own
+sudo ./dark_matter_recon.sh yourdomain.com
+
+# Low-RAM mode (recommended for Kali live USB with ~2GB RAM)
+sudo ./dark_matter_recon.sh yourdomain.com --light
+
+# Route HTTP traffic through Tor + use DNS-over-HTTPS
+sudo ./dark_matter_recon.sh yourdomain.com --tor --doh
+
+# Quiet mode — only CRITICAL and HIGH findings shown on screen
+sudo ./dark_matter_recon.sh yourdomain.com --quiet
+```
+
+Results are saved to `~/dark_matter_results/<timestamp>_<domain>/`
 
 ---
 
@@ -102,6 +160,8 @@ go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 | `--quiet` | Suppress verbose output — only CRITICAL/HIGH shown on screen |
 | `--light` | Low-RAM mode: cap subfinder@50, nmap `--min-parallelism 1`, skip Wayback |
 | `--enable-amass` | Enable amass passive enum (disabled by default — high RAM usage) |
+| `--tor` | Route HTTP/WHOIS through Tor SOCKS5 (port 9050); rotate circuit between phases. nmap always runs native — raw SYN scans are incompatible with SOCKS5 |
+| `--doh` | Use DNS-over-HTTPS for all A-record lookups (Cloudflare 1.1.1.1) instead of plain `dig` |
 | `--report-only` | Print last saved report and exit |
 
 ---
