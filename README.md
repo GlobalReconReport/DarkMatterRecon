@@ -239,6 +239,3 @@ After a full run, the report poses these detection questions:
 
 ---
 
-## Disclaimer
-
-This tool is for **authorized security testing only**. Only run against domains you own or have explicit written permission to test. Unauthorized scanning is illegal. The authors accept no liability for misuse.
